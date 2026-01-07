@@ -5,6 +5,7 @@ import { generateText } from "ai";
 import { config } from "dotenv";
 import { readFileSync, writeFileSync } from "fs";
 import { basename, dirname, join } from "path";
+import { execSync } from "child_process";
 
 // Load environment variables
 config({ path: join(dirname(new URL(import.meta.url).pathname), "..", ".env") });
@@ -89,7 +90,7 @@ function buildPrompt(text: string, level: number, startLine: number): string {
     1: `Focus ONLY on:
 - Spelling errors
 - Punctuation errors
-- Clear grammar mistakes (subject-verb agreement, tense consistency, etc.)
+- Clear grammar mistakes
 
 Do NOT suggest style or clarity improvements.`,
     2: `Focus on:
@@ -106,8 +107,8 @@ For style/clarity, only flag the most important issues like:
 - Spelling errors (auto-correct)
 - Punctuation errors (auto-correct)
 - Clear grammar mistakes (auto-correct)
-- All style suggestions (long sentences, passive voice, word choice)
-- All clarity suggestions (ambiguous pronouns, unclear references, jargon)
+- All style suggestions
+- All clarity suggestions
 
 Be thorough but preserve the author's voice.`,
   };
@@ -118,26 +119,56 @@ ${levelInstructions[level as 1 | 2 | 3]}
 
 IMPORTANT RULES:
 1. Line numbers start at ${startLine} for this chunk
-2. For AUTO-CORRECTIONS (spelling, punctuation, grammar): These will be applied automatically
-3. For SUGGESTIONS (style, clarity): These require manual review
-4. Preserve the author's voice and technical terminology
-5. Don't over-edit - only flag genuine issues
-6. For each issue, provide the exact line number where it occurs
+2. The "from" field must be the EXACT text to replace (case-sensitive)
+3. Preserve the author's voice and technical terminology
+4. Don't over-edit - only flag genuine issues
+5. SKIP ANY TEXT containing: backslashes, curly braces, superscripts/subscripts, or anything that looks like LaTeX/math notation
+6. DO NOT try to "fix" formatting of numbers, units, or mathematical expressions
+7. DO NOT change British to American English or vice versa
+8. Focus on ACTUAL spelling/grammar errors in plain prose only
 
-Respond in this exact JSON format:
-{
-  "autoCorrections": [
-    {"line": <number>, "type": "spelling|grammar|punctuation", "from": "<original>", "to": "<corrected>", "context": "<surrounding text>"}
-  ],
-  "suggestions": [
-    {"line": <number>, "type": "style|clarity", "text": "<description of issue>", "suggested": "<suggested fix or null if just flagging>", "context": "<surrounding text>"}
-  ]
-}
+Return a JSON array with this structure (no markdown, just raw JSON):
+[
+  {"line": <number>, "type": "auto-correction", "from": "<exact text>", "to": "<corrected>", "reason": "<brief reason>"},
+  {"line": <number>, "type": "suggestion", "from": "<original text>", "to": "<suggested replacement>", "reason": "<brief reason>"}
+]
+
+If text has no issues, return: []
 
 TEXT TO PROOFREAD:
 \`\`\`
 ${text}
 \`\`\``;
+}
+
+// Extract and sanitize JSON from response text
+function extractJson(response: string): string {
+  let jsonStr: string;
+
+  // Pattern 1: ```json ... ```
+  let match = response.match(/```json\s*([\s\S]*?)```/);
+  if (match) {
+    jsonStr = match[1].trim();
+  } else {
+    // Pattern 2: ``` ... ```
+    match = response.match(/```\s*([\s\S]*?)```/);
+    if (match) {
+      jsonStr = match[1].trim();
+    } else {
+      // Pattern 3: Find JSON array directly
+      match = response.match(/\[[\s\S]*\]/);
+      jsonStr = match ? match[0].trim() : response.trim();
+    }
+  }
+
+  // Sanitize common JSON issues from LLMs:
+  // - Fix unescaped newlines in strings
+  // - Fix unescaped backslashes
+  jsonStr = jsonStr
+    .replace(/\n\s*(?=[^"]*"[^"]*$)/gm, ' ') // Replace newlines inside strings
+    .replace(/(?<!\\)\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})/g, '\\\\'); // Escape invalid backslashes
+
+  return jsonStr;
 }
 
 async function proofreadChunk(
@@ -151,21 +182,49 @@ async function proofreadChunk(
     const { text: response } = await generateText({
       model: google(MODEL),
       prompt,
-      maxTokens: 4000,
     });
 
-    // Extract JSON from response (handle markdown code blocks)
-    let jsonStr = response;
-    const jsonMatch = response.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (jsonMatch) {
-      jsonStr = jsonMatch[1];
+    const jsonStr = extractJson(response);
+    let items;
+    try {
+      items = JSON.parse(jsonStr);
+    } catch (parseError) {
+      console.error("JSON parse error:", parseError);
+      console.error("First 500 chars of response:", response.slice(0, 500));
+      return { autoCorrections: [], suggestions: [] };
     }
 
-    const parsed = JSON.parse(jsonStr.trim());
-    return {
-      autoCorrections: parsed.autoCorrections || [],
-      suggestions: parsed.suggestions || [],
-    };
+    if (!Array.isArray(items)) {
+      console.error("Response is not an array:", typeof items);
+      return { autoCorrections: [], suggestions: [] };
+    }
+
+    // Split flat array into auto-corrections and suggestions
+    const autoCorrections: Change[] = [];
+    const suggestions: Suggestion[] = [];
+
+    for (const item of items) {
+      if (item.type === "auto-correction") {
+        autoCorrections.push({
+          line: item.line,
+          type: "grammar", // Generic type for auto-corrections
+          from: item.from,
+          to: item.to,
+          context: item.reason,
+        });
+      } else if (item.type === "suggestion") {
+        suggestions.push({
+          id: "", // Will be assigned later
+          line: item.line,
+          type: "style", // Generic type for suggestions
+          text: item.reason || "Style/clarity suggestion",
+          suggested: item.to,
+          context: item.from,
+        });
+      }
+    }
+
+    return { autoCorrections, suggestions };
   } catch (error) {
     console.error("Error calling Gemini API:", error);
     return { autoCorrections: [], suggestions: [] };
@@ -268,14 +327,149 @@ async function proofread(
   };
 }
 
+// Deterministic spell-check using aspell
+async function spellcheck(filePath: string): Promise<ProofreadResult> {
+  const text = readFileSync(filePath, "utf-8");
+  const fileName = basename(filePath);
+  const fileDir = dirname(filePath);
+  const correctedFileName = fileName.replace(/\.md$/, ".proofread.md");
+  const correctedFilePath = join(fileDir, correctedFileName);
+
+  console.error("Running aspell spell-check (British English)...");
+
+  const lines = text.split("\n");
+  const allAutoCorrections: Change[] = [];
+
+  // Check if aspell is available
+  try {
+    execSync("which aspell", { stdio: "ignore" });
+  } catch {
+    console.error("Error: aspell not found. Install with: brew install aspell");
+    process.exit(1);
+  }
+
+  // Process each line with aspell
+  for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+    const line = lines[lineNum];
+
+    // Skip lines that look like they contain code/LaTeX
+    if (line.match(/[\\{}$`]/) || line.match(/^```/) || line.match(/^\s*[-*]\s*\[/)) {
+      continue;
+    }
+
+    // Extract plain words (skip URLs, markdown links, etc.)
+    const cleanLine = line
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1") // Extract link text
+      .replace(/https?:\/\/[^\s]+/g, "") // Remove URLs
+      .replace(/`[^`]+`/g, "") // Remove inline code
+      .replace(/[_*]+/g, " "); // Remove emphasis markers
+
+    if (!cleanLine.trim()) continue;
+
+    try {
+      // Run aspell on the line
+      const result = execSync(
+        `echo "${cleanLine.replace(/"/g, '\\"')}" | aspell -a --lang=en_GB 2>/dev/null`,
+        { encoding: "utf-8", maxBuffer: 1024 * 1024 }
+      );
+
+      // Parse aspell output
+      // Format: & word count offset: suggestion1, suggestion2, ...
+      // Or: # word offset (no suggestions)
+      for (const aspellLine of result.split("\n")) {
+        const match = aspellLine.match(/^& (\S+) \d+ (\d+): (.+)$/);
+        if (match) {
+          const [, misspelled, , suggestionsStr] = match;
+          const suggestions = suggestionsStr.split(", ");
+
+          // Skip acronyms (all uppercase)
+          if (misspelled === misspelled.toUpperCase() && misspelled.length > 1) continue;
+
+          // Skip proper nouns (starts with capital, rest lowercase)
+          if (/^[A-Z][a-z]+$/.test(misspelled)) continue;
+
+          // Skip very short words (often abbreviations)
+          if (misspelled.length <= 2) continue;
+
+          // Skip words with numbers
+          if (/\d/.test(misspelled)) continue;
+
+          // Only auto-correct if suggestion is very similar (likely a typo)
+          if (suggestions.length > 0 && suggestions[0]) {
+            const suggestion = suggestions[0];
+
+            // Calculate similarity - only correct if difference is small
+            const lenDiff = Math.abs(misspelled.length - suggestion.length);
+            const isSimilar = lenDiff <= 2 &&
+              (misspelled.toLowerCase().includes(suggestion.toLowerCase().slice(0, 3)) ||
+               suggestion.toLowerCase().includes(misspelled.toLowerCase().slice(0, 3)));
+
+            // Only include if it looks like a genuine typo
+            if (isSimilar && line.includes(misspelled)) {
+              allAutoCorrections.push({
+                line: lineNum + 1,
+                type: "spelling",
+                from: misspelled,
+                to: suggestion,
+                context: `Suggestion: ${suggestions.slice(0, 3).join(", ")}`,
+              });
+            }
+          }
+        }
+      }
+    } catch {
+      // Ignore aspell errors for individual lines
+    }
+  }
+
+  // Deduplicate corrections (same word on same line)
+  const seen = new Set<string>();
+  const uniqueCorrections = allAutoCorrections.filter((c) => {
+    const key = `${c.line}:${c.from}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  // In spellcheck mode, don't auto-apply - just report as suggestions
+  // This is safer since aspell has limited vocabulary
+  const suggestions: Suggestion[] = uniqueCorrections.map((c, i) => ({
+    id: `S${i + 1}`,
+    line: c.line,
+    type: "spelling" as const,
+    text: `Possible misspelling: "${c.from}"`,
+    suggested: c.to,
+    context: c.context,
+  }));
+
+  // Write original file with suggestion comments (if any)
+  const correctedText = insertSuggestionComments(text, suggestions);
+  writeFileSync(correctedFilePath, correctedText, "utf-8");
+
+  return {
+    file: fileName,
+    correctedFile: correctedFileName,
+    level: 1, // Spellcheck is always level 1 (mechanical only)
+    autoApplied: {
+      count: 0, // No auto-corrections in spellcheck mode
+      changes: [],
+    },
+    suggestions, // All findings are suggestions for review
+  };
+}
+
 // CLI entry point
 async function main() {
   const args = process.argv.slice(2);
 
   if (args.length === 0) {
-    console.error("Usage: npx tsx proofread.ts <file.md> [--level 1|2|3]");
+    console.error("Usage: npx tsx proofread.ts <file.md> [--engine llm|spellcheck] [--level 1|2|3]");
     console.error("");
-    console.error("Levels:");
+    console.error("Engines:");
+    console.error("  llm        - Gemini-based proofreading (default)");
+    console.error("  spellcheck - Fast deterministic spell-check using aspell");
+    console.error("");
+    console.error("Levels (llm engine only):");
     console.error("  1 - Mechanical only (spelling, punctuation, grammar)");
     console.error("  2 - Light style pass (+ top 5-10 style suggestions)");
     console.error("  3 - Comprehensive review (all suggestions)");
@@ -284,6 +478,16 @@ async function main() {
 
   const filePath = args[0];
   let level = 2; // Default to level 2
+  let engine = "llm"; // Default to LLM
+
+  const engineIndex = args.indexOf("--engine");
+  if (engineIndex !== -1 && args[engineIndex + 1]) {
+    engine = args[engineIndex + 1];
+    if (!["llm", "spellcheck"].includes(engine)) {
+      console.error("Error: Engine must be 'llm' or 'spellcheck'");
+      process.exit(1);
+    }
+  }
 
   const levelIndex = args.indexOf("--level");
   if (levelIndex !== -1 && args[levelIndex + 1]) {
@@ -295,7 +499,14 @@ async function main() {
   }
 
   try {
-    const result = await proofread(filePath, level);
+    let result: ProofreadResult;
+
+    if (engine === "spellcheck") {
+      result = await spellcheck(filePath);
+    } else {
+      result = await proofread(filePath, level);
+    }
+
     // Output JSON to stdout for Claude to parse
     console.log(JSON.stringify(result, null, 2));
   } catch (error) {

@@ -5,30 +5,42 @@ description: This skill should be used when the user says "proofread", "spell ch
 
 # Proofread skill
 
-AI-powered proofreading using Gemini Flash. Checks spelling, grammar, style, and clarity in markdown documents using British English conventions.
+Proofreading for markdown documents using British English conventions. Two engines available:
+
+- **Spellcheck** (fast, deterministic): Uses aspell for spell-checking (~2 seconds)
+- **LLM** (thorough, AI-powered): Uses Gemini Flash for spelling, grammar, style, and clarity (~30-60 seconds per 100 lines)
 
 ## How it works
 
-1. **Safe corrections auto-applied**: Spelling, punctuation, and clear grammar errors are fixed automatically
-2. **Style/clarity as suggestions**: Flagged with IDs (S1, S2, etc.) for manual review
+1. **Spellcheck engine**: Reports possible misspellings as suggestions for review (no auto-apply, since aspell has limited vocabulary)
+2. **LLM engine**: Auto-applies safe corrections (spelling, punctuation, grammar), flags style/clarity as suggestions with IDs (S1, S2, etc.)
 3. **Interactive acceptance**: User types suggestion IDs to accept them
 
 ## Workflow
 
-### Step 1: Ask for proofreading level
+### Step 1: Ask which engine and level
 
 When the user wants to proofread a document, ask:
 
-> What level of proofreading do you want?
+> Which proofreading approach do you want?
 >
-> **Level 1 — Mechanical only**: Spelling, punctuation, grammar (fast, minimal output)
-> **Level 2 — Light style pass**: Level 1 + top 5-10 style/clarity suggestions (recommended)
-> **Level 3 — Comprehensive**: All style/clarity suggestions (thorough, more output)
+> **Spellcheck** — Fast deterministic spell-check using aspell (~2 seconds). Good for quick checks.
+>
+> **LLM** — AI-powered proofreading using Gemini Flash (~30-60s per 100 lines). Choose a level:
+> - **Level 1 — Mechanical only**: Spelling, punctuation, grammar (fast, minimal output)
+> - **Level 2 — Light style pass**: Level 1 + top 5-10 style/clarity suggestions (recommended)
+> - **Level 3 — Comprehensive**: All style/clarity suggestions (thorough, more output)
 
 ### Step 2: Run the proofreading script
 
+For spellcheck engine:
 ```bash
-cd ~/.claude/skills/proofread && npx tsx scripts/proofread.ts "<file_path>" --level <1|2|3>
+cd ~/.claude/skills/proofread && npx tsx scripts/proofread.ts "<file_path>" --engine spellcheck
+```
+
+For LLM engine:
+```bash
+cd ~/.claude/skills/proofread && npx tsx scripts/proofread.ts "<file_path>" --engine llm --level <1|2|3>
 ```
 
 The script outputs JSON to stdout. Parse it and present to the user.
@@ -88,7 +100,12 @@ cd ~/.claude/skills/proofread && yarn install
 
 The skill uses these environment variables from `.env`:
 - `GOOGLE_AI_API_KEY`: Google AI API key for Gemini
-- `PROOFREAD_MODEL`: Model ID (default: gemini-3-flash-preview)
+- `PROOFREAD_MODEL`: Model ID (default: gemini-2.0-flash)
+
+The spellcheck engine requires `aspell` to be installed:
+```bash
+brew install aspell
+```
 
 ## Output files
 
