@@ -2,25 +2,29 @@
 
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { generateText } from "ai";
-import { config } from "dotenv";
-import { readFileSync, writeFileSync } from "fs";
+import { parse } from "dotenv";
+import { existsSync, readFileSync, writeFileSync } from "fs";
 import { basename, dirname, join } from "path";
 import { execSync } from "child_process";
 
-// Load environment variables
-config({ path: join(dirname(new URL(import.meta.url).pathname), "..", ".env") });
+// Load environment variables ONLY from the skill's .env file (not shell environment)
+const envPath = join(dirname(new URL(import.meta.url).pathname), "..", ".env");
+let GOOGLE_AI_API_KEY: string | undefined;
+let MODEL = "gemini-2.0-flash";
 
-const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY;
-const MODEL = process.env.PROOFREAD_MODEL || "gemini-3-flash-preview";
-
-if (!GOOGLE_AI_API_KEY) {
-  console.error("Error: GOOGLE_AI_API_KEY not set in .env file");
-  process.exit(1);
+if (existsSync(envPath)) {
+  const envConfig = parse(readFileSync(envPath));
+  GOOGLE_AI_API_KEY = envConfig.GOOGLE_AI_API_KEY;
+  MODEL = envConfig.PROOFREAD_MODEL || MODEL;
 }
 
-const google = createGoogleGenerativeAI({
-  apiKey: GOOGLE_AI_API_KEY,
-});
+// Only create the Google client if we have an API key (spellcheck mode doesn't need it)
+let google: ReturnType<typeof createGoogleGenerativeAI> | undefined;
+if (GOOGLE_AI_API_KEY) {
+  google = createGoogleGenerativeAI({
+    apiKey: GOOGLE_AI_API_KEY,
+  });
+}
 
 interface Change {
   line: number;
@@ -33,7 +37,7 @@ interface Change {
 interface Suggestion {
   id: string;
   line: number;
-  type: "style" | "clarity";
+  type: "style" | "clarity" | "spelling";
   text: string;
   suggested: string | null;
   context?: string;
@@ -85,7 +89,8 @@ function chunkText(text: string, maxTokens: number = 6000): string[] {
   return chunks;
 }
 
-function buildPrompt(text: string, level: number, startLine: number): string {
+function buildPrompt(text: string, level: number, startLine: number, language: string = "british"): string {
+  const langLabel = language === "american" ? "American English" : "British English";
   const levelInstructions = {
     1: `Focus ONLY on:
 - Spelling errors
@@ -113,7 +118,7 @@ For style/clarity, only flag the most important issues like:
 Be thorough but preserve the author's voice.`,
   };
 
-  return `You are a professional proofreader. Review the following text using British English conventions.
+  return `You are a professional proofreader. Review the following text using ${langLabel} conventions.
 
 ${levelInstructions[level as 1 | 2 | 3]}
 
@@ -174,9 +179,16 @@ function extractJson(response: string): string {
 async function proofreadChunk(
   text: string,
   level: number,
-  startLine: number
+  startLine: number,
+  language: string = "british"
 ): Promise<{ autoCorrections: Change[]; suggestions: Suggestion[] }> {
-  const prompt = buildPrompt(text, level, startLine);
+  if (!google) {
+    console.error("Error: GOOGLE_AI_API_KEY not configured in the skill's .env file");
+    console.error("Please add your Google AI API key to: " + envPath);
+    process.exit(1);
+  }
+
+  const prompt = buildPrompt(text, level, startLine, language);
 
   try {
     const { text: response } = await generateText({
@@ -269,7 +281,8 @@ function insertSuggestionComments(text: string, suggestions: Suggestion[]): stri
 
 async function proofread(
   filePath: string,
-  level: number
+  level: number,
+  language: string = "british"
 ): Promise<ProofreadResult> {
   const text = readFileSync(filePath, "utf-8");
   const fileName = basename(filePath);
@@ -290,7 +303,8 @@ async function proofread(
     const { autoCorrections, suggestions } = await proofreadChunk(
       chunks[i],
       level,
-      currentLine
+      currentLine,
+      language
     );
 
     allAutoCorrections.push(...autoCorrections);
@@ -463,7 +477,7 @@ async function main() {
   const args = process.argv.slice(2);
 
   if (args.length === 0) {
-    console.error("Usage: npx tsx proofread.ts <file.md> [--engine llm|spellcheck] [--level 1|2|3]");
+    console.error("Usage: npx tsx proofread.ts <file.md> [--engine llm|spellcheck] [--level 1|2|3] [--language british|american]");
     console.error("");
     console.error("Engines:");
     console.error("  llm        - Gemini-based proofreading (default)");
@@ -479,6 +493,7 @@ async function main() {
   const filePath = args[0];
   let level = 2; // Default to level 2
   let engine = "llm"; // Default to LLM
+  let language = "british"; // Default to British English
 
   const engineIndex = args.indexOf("--engine");
   if (engineIndex !== -1 && args[engineIndex + 1]) {
@@ -498,13 +513,22 @@ async function main() {
     }
   }
 
+  const langIndex = args.indexOf("--language");
+  if (langIndex !== -1 && args[langIndex + 1]) {
+    language = args[langIndex + 1].toLowerCase();
+    if (language !== "british" && language !== "american") {
+      console.error("Error: Language must be 'british' or 'american'");
+      process.exit(1);
+    }
+  }
+
   try {
     let result: ProofreadResult;
 
     if (engine === "spellcheck") {
       result = await spellcheck(filePath);
     } else {
-      result = await proofread(filePath, level);
+      result = await proofread(filePath, level, language);
     }
 
     // Output JSON to stdout for Claude to parse

@@ -24,12 +24,39 @@ When the user wants to proofread a document, ask:
 
 > Which proofreading approach do you want?
 >
-> **Spellcheck** — Fast deterministic spell-check using aspell (~2 seconds). Good for quick checks.
+> **Spellcheck** — Fast deterministic spell-check using aspell (~2 seconds). Good for quick checks. No API key required.
 >
 > **LLM** — AI-powered proofreading using Gemini Flash (~30-60s per 100 lines). Choose a level:
 > - **Level 1 — Mechanical only**: Spelling, punctuation, grammar (fast, minimal output)
 > - **Level 2 — Light style pass**: Level 1 + top 5-10 style/clarity suggestions (recommended)
 > - **Level 3 — Comprehensive**: All style/clarity suggestions (thorough, more output)
+
+### Step 1a: Check API key (LLM modes only)
+
+**Skip this step if the user chose Spellcheck.**
+
+If the user chose an LLM level, check if the API key is configured:
+
+1. Read `~/.claude/skills/proofread/.env`
+2. Check if it contains `GOOGLE_AI_API_KEY=` with a value
+
+**If the key is missing or the file doesn't exist**, tell the user:
+
+> The LLM proofreading modes require a Google AI API key to use Gemini.
+>
+> To set it up:
+> 1. Go to https://aistudio.google.com/app/apikey
+> 2. Create an API key
+> 3. Add it to `~/.claude/skills/proofread/.env`:
+>    ```
+>    GOOGLE_AI_API_KEY=your_key_here
+>    ```
+>
+> Would you like me to create the .env file for you once you have the key?
+>
+> Alternatively, you can use the **Spellcheck** mode which doesn't require an API key.
+
+**Important:** Do not search for the API key in the user's shell environment or other locations. Only use the key from the skill's `.env` file.
 
 ### Step 2: Run the proofreading script
 
@@ -98,8 +125,8 @@ cd ~/.claude/skills/proofread && yarn install
 
 ## Configuration
 
-The skill uses these environment variables from `.env`:
-- `GOOGLE_AI_API_KEY`: Google AI API key for Gemini
+The skill uses these environment variables from `.env` (LLM modes only):
+- `GOOGLE_AI_API_KEY`: Google AI API key for Gemini (required for LLM modes)
 - `PROOFREAD_MODEL`: Model ID (default: gemini-2.0-flash)
 
 The spellcheck engine requires `aspell` to be installed:
