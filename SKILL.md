@@ -145,7 +145,3 @@ brew install aspell
 - Preserves author's voice and technical terminology
 - Processes long documents in chunks automatically
 - Progress shown via stderr, results via stdout (JSON)
-
-## Update check
-
-This skill is managed by [skills.sh](https://skills.sh). To check for updates, run `npx skills update`.
