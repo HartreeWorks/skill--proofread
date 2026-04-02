@@ -2,3 +2,6 @@ node_modules/
 dist/
 .env
 *.log
+
+# Private local data (not published)
+data/
